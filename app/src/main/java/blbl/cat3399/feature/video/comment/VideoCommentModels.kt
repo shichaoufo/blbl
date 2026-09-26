@@ -52,7 +52,7 @@ internal fun parseVideoCommentReplyItem(
             ?: obj.optLong("note_cvid", 0L)
     val ctime = obj.optLong("ctime", 0L).takeIf { it > 0L } ?: 0L
     val like = obj.optLong("like", 0L).coerceAtLeast(0L)
-    val replyCount = obj.optInt("count", 0).coerceAtLeast(0)
+    val replyCount = parseVideoCommentReplyCount(obj)
     val replyPreviews =
         if (canOpenThread && replyCount > 0) {
             val replies = obj.optJSONArray("replies") ?: JSONArray()
@@ -84,6 +84,27 @@ internal fun parseVideoCommentReplyItem(
         canOpenThread = canOpenThread,
         isUp = isUp,
     )
+}
+
+/**
+ * 主评论的「二级评论数」——**必须取 `rcount`**，不能取 `count`。
+ *
+ * `rcount` 严格等于 `/x/v2/reply/reply` 返回的 `page.count`，也就是展开后真正能看到的
+ * 回复条数；`count` 会多算（含待审核 / 已折叠 / 嵌套重复计数）。真机接口实测：
+ *
+ * | `count` | `rcount` | 楼接口 `page.count` |
+ * |---|---|---|
+ * | 167 | 129 | **129** |
+ * | 1 | **0** | **0**（`replies` 为空） |
+ *
+ * 第二行就是用户报的症状：明明没有回复，却显示「查看全部 1 条回复」，点进去只有主评论自己。
+ * BbQ 的 `CommentManager::parseCommentObject` 用的也是 `rcount`（只有它俩一致时才相等）。
+ *
+ * `rcount` 缺失时（老接口 / 子评论对象）回退到 `count`。
+ */
+internal fun parseVideoCommentReplyCount(obj: JSONObject): Int {
+    if (obj.has("rcount")) return obj.optInt("rcount", 0).coerceAtLeast(0)
+    return obj.optInt("count", 0).coerceAtLeast(0)
 }
 
 internal data class VideoCommentReplyPreview(

@@ -1,5 +1,17 @@
 # CHANGELOG
 
+## 0.1.30
+
+1. 修复部分电视（如 TCL Q10G）弹幕前后抖动：默认渲染视图改为 TextureView
+   （SurfaceView 的独立视频层会让合成器把 UI 层 vsync 对齐到视频层去等帧）
+2. 修复弹幕时快时慢：时间轴改为累加真实 vsync 时间戳之差
+3. 修复评论回复数多算：改用 rcount（count 会把待审核/折叠条目算进去）
+4. 修复评论区动图不播放 / 显示全透明：动图不再追加 CDN 静态化后缀，播放改用 Movie 自驱动
+5. 新增：评论区图片支持播放动图（GIF / 动画 WebP）
+6. 新增：弹幕渲染诊断日志（BLBL/DanmakuPerf）
+7. 移除上游相关功能：上传日志、自动检查更新、检查更新、QQ 交流群入口
+8. 发布流程：push tag 即编译 release 包并发布到 GitHub Releases
+
 ## 0.1.29
 
 1. 增加直播SC显示

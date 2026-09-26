@@ -42,6 +42,15 @@ internal class DanmakuTimer {
 
     fun currentPositionMs(): Long = smoothPositionMs.toLong()
 
+    /**
+     * 带亚毫秒精度的当前位置（ms）。
+     *
+     * 弹幕的 x 坐标由其逐帧位移**差分**得出，必须用这个值：位置本身是 Double 精确累积的，
+     * 若只把整数毫秒交给引擎，120Hz 下每帧 8.333ms 会被量化成 8/8/9…，
+     * 位移出现「每三帧多走一点」的规律性节拍 —— 恒定但周期性，比随机抖动刺眼得多。
+     */
+    fun currentPositionExactMs(): Double = smoothPositionMs
+
     fun step(
         nowNanos: Long,
         rawPositionMs: Long,

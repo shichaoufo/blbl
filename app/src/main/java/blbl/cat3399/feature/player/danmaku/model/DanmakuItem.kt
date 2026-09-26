@@ -36,6 +36,9 @@ internal class DanmakuItem(
     // ---- Active state (action thread only) ----
     var kind: DanmakuKind = DanmakuKind.SCROLL
     var lane: Int = 0
+
+    /** 占用轨道数：只有大表情（bulge）撑高底图时 >1，普通弹幕与大小表情之外的弹幕恒为 1。 */
+    var laneSpan: Int = 1
     var startTimeMs: Int = 0
     var durationMs: Int = 0
     var pxPerMs: Float = 0f

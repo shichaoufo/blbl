@@ -106,12 +106,8 @@ enum class SettingId(
     PlayerKernelCheck("player_kernel_check"),
     AppVersion("app_version"),
     ProjectUrl("project_url"),
-    QqGroup("qq_group"),
     LogTag("log_tag"),
     ExportLogs("export_logs"),
-    UploadLogs("upload_logs"),
-    AutoUpdateCheckEnabled("auto_update_check_enabled"),
-    CheckUpdate("check_update"),
 
     // 设备信息
     DeviceCpu("device_cpu"),

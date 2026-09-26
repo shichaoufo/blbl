@@ -197,7 +197,9 @@ internal class VideoCommentImageViewerController(
         val picture = currentPictures[idx]
         views.image.resetViewport()
         views.image.setSourceDimensions(width = picture.width, height = picture.height)
-        ImageLoader.loadInto(views.image, picture.url)
+        // 评论区图片可能是 GIF / 动画 WebP（B站 CDN 对动图保留原始后缀，这里拿到的就是原图 URL）：
+        // 允许播放动图，静态图仍走原来的 BitmapFactory 路径。
+        ImageLoader.loadInto(views.image, picture.url, allowAnimated = true)
         updateNavigationUi()
     }
 

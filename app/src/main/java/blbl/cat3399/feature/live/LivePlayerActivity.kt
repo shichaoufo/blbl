@@ -1741,6 +1741,7 @@ class LivePlayerActivity : BaseActivity() {
                 fontSize = 25,
                 weight = 0,
                 attr = 0,
+                emotes = ev.emotes.takeIf { it.isNotEmpty() },
             )
         binding.danmakuView.appendDanmakus(listOf(d), maxItems = 2000, alreadySorted = true)
     }

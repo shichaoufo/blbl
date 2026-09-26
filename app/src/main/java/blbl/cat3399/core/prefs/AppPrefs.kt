@@ -128,14 +128,6 @@ class AppPrefs(context: Context) {
         get() = prefs.getBoolean(KEY_DYNAMIC_FOLLOWING_RECENT_UPDATE_DOT_ENABLED, false)
         set(value) = prefs.edit().putBoolean(KEY_DYNAMIC_FOLLOWING_RECENT_UPDATE_DOT_ENABLED, value).apply()
 
-    var autoUpdateCheckEnabled: Boolean
-        get() = prefs.getBoolean(KEY_AUTO_UPDATE_CHECK_ENABLED, true)
-        set(value) = prefs.edit().putBoolean(KEY_AUTO_UPDATE_CHECK_ENABLED, value).apply()
-
-    var autoUpdateIgnoredVersionName: String?
-        get() = prefs.getString(KEY_AUTO_UPDATE_IGNORED_VERSION_NAME, null)?.trim()?.takeIf { it.isNotBlank() }
-        set(value) = prefs.edit().putString(KEY_AUTO_UPDATE_IGNORED_VERSION_NAME, value?.trim()).apply()
-
     var userAgent: String
         get() = prefs.getString(KEY_UA, DEFAULT_UA) ?: DEFAULT_UA
         set(value) = prefs.edit().putString(KEY_UA, value).apply()
@@ -338,16 +330,30 @@ class AppPrefs(context: Context) {
         get() = prefs.getBoolean(KEY_PLAYER_SEAMLESS_QUALITY_SWITCH_ENABLED, true)
         set(value) = prefs.edit().putBoolean(KEY_PLAYER_SEAMLESS_QUALITY_SWITCH_ENABLED, value).apply()
 
+    /**
+     * 视频输出图层。默认 **TextureView**（2026-09-26 由 SurfaceView 改过来）。
+     *
+     * 真机（TCL tcl_m7642 / Android 9）同一间直播室 A/B 实测：
+     *   - SurfaceView：节拍被拉到 17.34ms（57.7Hz）、掉拍 5.09%，且出现 33~83ms 的
+     *     3×/4× 档 —— SurfaceView 是**独立硬件层**，合成器会把 UI 层的 vsync 对齐到
+     *     视频层去「等帧」，弹幕跟着一顿一窜；
+     *   - TextureView：节拍回到 16.68ms（59.96Hz）、掉拍 2.68%、3×/4× 档归零，
+     *     与同机点播段（2.56%）持平 —— 视频帧走应用自己的绘制，没有独立视频层可对齐。
+     *
+     * 代价：视频多一次 GPU 采样，低端机上占用略升（本机实测 drawMs 反而更低：
+     * 0.42 → 0.26ms）。bilibili 无 DRM，安全输出不受影响。
+     * 用户在「其他设置 → 渲染视图」可随时切回 SurfaceView。
+     */
     var playerRenderViewType: String
         get() {
-            val raw = prefs.getString(KEY_PLAYER_RENDER_VIEW, PLAYER_RENDER_VIEW_SURFACE_VIEW) ?: PLAYER_RENDER_VIEW_SURFACE_VIEW
+            val raw = prefs.getString(KEY_PLAYER_RENDER_VIEW, PLAYER_RENDER_VIEW_TEXTURE_VIEW) ?: PLAYER_RENDER_VIEW_TEXTURE_VIEW
             val v = raw.trim()
             return when (v) {
                 PLAYER_RENDER_VIEW_SURFACE_VIEW,
                 PLAYER_RENDER_VIEW_TEXTURE_VIEW,
                 -> v
 
-                else -> PLAYER_RENDER_VIEW_SURFACE_VIEW
+                else -> PLAYER_RENDER_VIEW_TEXTURE_VIEW
             }
         }
         set(value) {
@@ -1071,8 +1077,6 @@ class AppPrefs(context: Context) {
         private const val KEY_MAIN_MY_VISIBLE_TABS = "main_my_visible_tabs"
         private const val KEY_FOLLOWING_LIST_ORDER = "following_list_order"
         private const val KEY_DYNAMIC_FOLLOWING_RECENT_UPDATE_DOT_ENABLED = "dynamic_following_recent_update_dot_enabled"
-        private const val KEY_AUTO_UPDATE_CHECK_ENABLED = "auto_update_check_enabled"
-        private const val KEY_AUTO_UPDATE_IGNORED_VERSION_NAME = "auto_update_ignored_version_name"
         private const val KEY_IMAGE_QUALITY = "image_quality"
         private const val KEY_DANMAKU_ENABLED = "danmaku_enabled"
         private const val KEY_DANMAKU_ALLOW_TOP = "danmaku_allow_top"

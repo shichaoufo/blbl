@@ -29,7 +29,7 @@ internal interface DanmakuEngineMainApi {
 
     fun lastDrawFallbackCount(): Int
 
-    fun stepTime(positionMs: Long, uiFrameId: Int)
+    fun stepTime(positionMsExact: Double, uiFrameId: Int)
 
     fun drainReleasedBitmaps(uiFrameId: Int)
 
@@ -43,7 +43,7 @@ internal interface DanmakuEngineActionApi {
 
     fun updateConfig(newConfig: DanmakuConfig)
 
-    fun stepTime(positionMs: Long, uiFrameId: Int)
+    fun stepTime(positionMsExact: Double, uiFrameId: Int)
 
     fun currentPositionMs(): Long
 
@@ -125,6 +125,10 @@ internal class DanmakuEngine(
     override fun lastDrawFallbackCount(): Int = lastDrawFallbackCount
 
     // ---- Time (main writes; action reads) ----
+    // 滚动弹幕的 x 坐标由 elapsed 的逐帧差分决定，必须保留亚毫秒精度：
+    // 量化到整数毫秒会让 120Hz 下 8.333ms 的帧间隔变成 8/8/9 的规律性步长（可见抖动）。
+    // 整数毫秒版本继续用于轨道分配、激活/过期判定等对精度不敏感的场合。
+    @Volatile private var currentPositionExactMs: Double = 0.0
     @Volatile private var currentPositionMs: Long = 0L
     @Volatile private var currentUiFrameId: Int = 0
 
@@ -227,8 +231,10 @@ internal class DanmakuEngine(
     private fun sp(v: Float): Float =
         TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, v, displayMetrics)
 
-    override fun stepTime(positionMs: Long, uiFrameId: Int) {
-        currentPositionMs = positionMs.coerceAtLeast(0L)
+    override fun stepTime(positionMsExact: Double, uiFrameId: Int) {
+        val exact = if (positionMsExact.isFinite()) positionMsExact.coerceAtLeast(0.0) else 0.0
+        currentPositionExactMs = exact
+        currentPositionMs = exact.toLong()
         currentUiFrameId = uiFrameId
     }
 
@@ -387,11 +393,12 @@ internal class DanmakuEngine(
         }
 
         drawFill.getFontMetrics(drawFontMetrics)
-        val baselineOffset = outlinePad - drawFontMetrics.ascent
-        val emoteSizePx = (drawFontMetrics.descent - drawFontMetrics.ascent).coerceAtLeast(1f)
         val styleGen = cacheStyleGeneration
         val width = viewportWidth.coerceAtLeast(0)
-        val nowMs = currentPositionMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        // 绘制用亚毫秒精度的时间轴。逐帧位移 = elapsed 的差分，量化到整数毫秒
+        // 会把 8.333ms 的帧间隔变成 8/8/9 的规律性步长（比随机抖动更刺眼）。
+        // act 阶段仍走整数毫秒，轨道分配不需要更高精度。
+        val nowMsExact = currentPositionExactMs
 
         var cachedDrawn = 0
         var fallbackDrawn = 0
@@ -399,7 +406,13 @@ internal class DanmakuEngine(
             val item = snapshot.items[i] ?: continue
             val x =
                 when (item.kind) {
-                    DanmakuKind.SCROLL -> scrollX(width = width, nowMs = nowMs, startTimeMs = item.startTimeMs, pxPerMs = item.pxPerMs)
+                    DanmakuKind.SCROLL ->
+                        danmakuScrollX(
+                            width = width,
+                            nowMs = nowMsExact,
+                            startTimeMs = item.startTimeMs,
+                            pxPerMs = item.pxPerMs,
+                        )
                     DanmakuKind.TOP -> centerX(width = width, contentWidth = item.textWidthPx)
                     DanmakuKind.BOTTOM -> centerX(width = width, contentWidth = item.textWidthPx)
                 }
@@ -417,9 +430,7 @@ internal class DanmakuEngine(
                 x = x,
                 yTop = yTop,
                 outlinePad = outlinePad,
-                baselineOffset = baselineOffset,
                 opacityAlpha = opacityAlpha,
-                emoteSizePx = emoteSizePx,
             )
         }
         lastDrawCachedCount = cachedDrawn
@@ -620,7 +631,8 @@ internal class DanmakuEngine(
         while (index < items.size && items[index].timeMs() <= nowMs) {
             val item = items[index]
             index++
-            if (item.data.text.isBlank()) continue
+            // 纯表情弹幕（文本为空、只带表情图）也要正常入场
+            if (item.data.text.isBlank() && item.data.emotes.isNullOrEmpty()) continue
             if (item.timeMs() < nowMs - max(rollingDurationMs, fixedDurationMs)) continue
             tryAdmitItem(
                 item = item,
@@ -733,7 +745,8 @@ internal class DanmakuEngine(
             val item = items[index]
             index++
             spawnAttempts++
-            if (item.data.text.isBlank()) continue
+            // 纯表情弹幕（文本为空、只带表情图）也要正常入场
+            if (item.data.text.isBlank() && item.data.emotes.isNullOrEmpty()) continue
             tryAdmitItem(
                 item = item,
                 nowMs = nowMs,
@@ -764,6 +777,11 @@ internal class DanmakuEngine(
         allowPending: Boolean,
     ): Boolean {
         val textWidth = measureTextWidth(item, outlinePad)
+        // 只有大表情（bulge_display）会撑高底图、跨多条轨道占用；
+        // 小表情与公共表情恒占一条轨道，无表情的普通弹幕布局与改造前完全一致。
+        val laneSpanScale = if (hasInlineCandidate(item)) maxLaneSpanScaleOf(item) else 0f
+        item.laneSpan =
+            if (laneSpanScale <= 0f) 1 else laneSpanFor(contentBoxHeightPx(outlinePad, laneSpanScale), laneHeight)
         val kind = kindOf(item.data)
         val marginPx = max(12f, (textSizePx + outlinePad * 2f) * 0.6f)
         val admitted =
@@ -836,40 +854,44 @@ internal class DanmakuEngine(
                 fallbackDurationMs = rollingDurationMs,
             )
         for (lane in 0 until laneCount) {
-            val prev = laneLastScroll[lane]
-            if (prev != null && isExpired(prev, width = width, nowMs = nowMs)) {
-                laneLastScroll[lane] = null
+            // 该条要独占 lane..lane+span-1：任一道被占（且未让位）就不能放，
+            // 放下去就会和大表情的底图重叠
+            val span = item.laneSpan.coerceIn(1, laneCount - lane)
+            var blocked = false
+            for (k in 0 until span) {
+                val laneIndex = lane + k
+                val prev = laneLastScroll[laneIndex]
+                if (prev != null && isExpired(prev, width = width, nowMs = nowMs)) {
+                    laneLastScroll[laneIndex] = null
+                }
+                val rear = laneLastScroll[laneIndex] ?: continue
+                val tailPrev =
+                    danmakuScrollX(
+                        width = width,
+                        nowMs = nowMs.toDouble(),
+                        startTimeMs = rear.startTimeMs,
+                        pxPerMs = rear.pxPerMs,
+                    ) + rear.textWidthPx
+                if (!isScrollLaneAvailable(width.toFloat(), nowMs, rear, tailPrev, pxNew, marginPx)) {
+                    blocked = true
+                    break
+                }
             }
-            val rear = laneLastScroll[lane]
-            if (rear == null) {
-                activate(
-                    item = item,
-                    kind = DanmakuKind.SCROLL,
-                    lane = lane,
-                    textWidth = textWidth,
-                    pxPerMs = pxNew,
-                    durationMs = durationMs,
-                    startTimeMs = nowMs,
-                    layoutTopPx = (topInset.toFloat() + laneHeight * lane).coerceAtMost(maxYTop),
-                )
-                laneLastScroll[lane] = item
-                return true
+            if (blocked) continue
+            activate(
+                item = item,
+                kind = DanmakuKind.SCROLL,
+                lane = lane,
+                textWidth = textWidth,
+                pxPerMs = pxNew,
+                durationMs = durationMs,
+                startTimeMs = nowMs,
+                layoutTopPx = (topInset.toFloat() + laneHeight * lane).coerceAtMost(maxYTop),
+            )
+            for (k in 0 until span) {
+                laneLastScroll[lane + k] = item
             }
-            val tailPrev = scrollX(width = width, nowMs = nowMs, startTimeMs = rear.startTimeMs, pxPerMs = rear.pxPerMs) + rear.textWidthPx
-            if (isScrollLaneAvailable(width.toFloat(), nowMs, rear, tailPrev, pxNew, marginPx)) {
-                activate(
-                    item = item,
-                    kind = DanmakuKind.SCROLL,
-                    lane = lane,
-                    textWidth = textWidth,
-                    pxPerMs = pxNew,
-                    durationMs = durationMs,
-                    startTimeMs = nowMs,
-                    layoutTopPx = (topInset.toFloat() + laneHeight * lane).coerceAtMost(maxYTop),
-                )
-                laneLastScroll[lane] = item
-                return true
-            }
+            return true
         }
         return false
     }
@@ -892,11 +914,20 @@ internal class DanmakuEngine(
                 DanmakuKind.SCROLL -> return false
             }
         for (lane in 0 until laneCount) {
-            val prev = lanes[lane]
-            if (prev != null && isExpired(prev, width = viewportWidth, nowMs = nowMs)) {
-                lanes[lane] = null
+            val span = item.laneSpan.coerceIn(1, laneCount - lane)
+            var blocked = false
+            for (k in 0 until span) {
+                val laneIndex = lane + k
+                val prev = lanes[laneIndex]
+                if (prev != null && isExpired(prev, width = viewportWidth, nowMs = nowMs)) {
+                    lanes[laneIndex] = null
+                }
+                if (lanes[laneIndex] != null) {
+                    blocked = true
+                    break
+                }
             }
-            if (lanes[lane] != null) continue
+            if (blocked) continue
             activate(
                 item = item,
                 kind = kind,
@@ -908,11 +939,14 @@ internal class DanmakuEngine(
                 layoutTopPx =
                     when (kind) {
                         DanmakuKind.TOP -> (topInset.toFloat() + laneHeight * lane).coerceAtMost(maxYTop)
-                        DanmakuKind.BOTTOM -> (maxYTop - laneHeight * lane).coerceAtLeast(topInset.toFloat())
+                        DanmakuKind.BOTTOM ->
+                            (maxYTop - laneHeight * (lane + span - 1)).coerceAtLeast(topInset.toFloat())
                         DanmakuKind.SCROLL -> topInset.toFloat()
                     },
             )
-            lanes[lane] = item
+            for (k in 0 until span) {
+                lanes[lane + k] = item
+            }
             return true
         }
         return false
@@ -969,10 +1003,26 @@ internal class DanmakuEngine(
     }
 
     private fun clearLaneReferenceIfMatch(item: DanmakuItem) {
+        val span = item.laneSpan.coerceAtLeast(1)
         when (item.kind) {
-            DanmakuKind.SCROLL -> if (item.lane in laneLastScroll.indices && laneLastScroll[item.lane] === item) laneLastScroll[item.lane] = null
-            DanmakuKind.TOP -> if (item.lane in laneLastTop.indices && laneLastTop[item.lane] === item) laneLastTop[item.lane] = null
-            DanmakuKind.BOTTOM -> if (item.lane in laneLastBottom.indices && laneLastBottom[item.lane] === item) laneLastBottom[item.lane] = null
+            DanmakuKind.SCROLL -> {
+                for (k in 0 until span) {
+                    val lane = item.lane + k
+                    if (lane in laneLastScroll.indices && laneLastScroll[lane] === item) laneLastScroll[lane] = null
+                }
+            }
+            DanmakuKind.TOP -> {
+                for (k in 0 until span) {
+                    val lane = item.lane + k
+                    if (lane in laneLastTop.indices && laneLastTop[lane] === item) laneLastTop[lane] = null
+                }
+            }
+            DanmakuKind.BOTTOM -> {
+                for (k in 0 until span) {
+                    val lane = item.lane + k
+                    if (lane in laneLastBottom.indices && laneLastBottom[lane] === item) laneLastBottom[lane] = null
+                }
+            }
         }
     }
 
@@ -984,19 +1034,17 @@ internal class DanmakuEngine(
         val elapsed = nowMs - item.startTimeMs
         if (elapsed >= item.durationMs) return true
         if (item.kind != DanmakuKind.SCROLL) return false
-        return scrollX(width = width, nowMs = nowMs, startTimeMs = item.startTimeMs, pxPerMs = item.pxPerMs) + item.textWidthPx < 0f
+        return danmakuScrollX(
+            width = width,
+            nowMs = nowMs.toDouble(),
+            startTimeMs = item.startTimeMs,
+            pxPerMs = item.pxPerMs,
+        ) + item.textWidthPx < 0f
     }
 
     private fun inlineImagesReadyOrPrefetch(item: DanmakuItem): Boolean {
-        val text = item.data.text
-        if ((!config.showHighLikeIcon || !item.data.isHighLiked) && !text.contains('[')) return true
-        val segments =
-            item.inlineSegments
-                ?: run {
-                    val parsed = parseInlineSegments(item) ?: return true
-                    if (shouldCacheInlineSegments(item)) item.inlineSegments = parsed
-                    parsed
-                }
+        if (!hasInlineCandidate(item)) return true
+        val segments = inlineSegmentsOf(item) ?: return true
         var ready = true
         for (seg in segments) {
             if (seg !is DanmakuInlineSegment.Emote) continue
@@ -1008,9 +1056,66 @@ internal class DanmakuEngine(
         return ready
     }
 
-    private fun scrollX(width: Int, nowMs: Int, startTimeMs: Int, pxPerMs: Float): Float {
-        val elapsed = (nowMs - startTimeMs).coerceAtLeast(0)
-        return width.toFloat() - elapsed * pxPerMs
+    /** 这条弹幕是否可能含行内图（点赞图标或表情）。纯文本走原来的快速路径。 */
+    private fun hasInlineCandidate(item: DanmakuItem): Boolean {
+        if (!item.data.emotes.isNullOrEmpty()) return true
+        if (config.showHighLikeIcon && item.data.isHighLiked) return true
+        return item.data.text.contains('[')
+    }
+
+    /** 行内分段（含解析结果缓存）。返回 null = 纯文本弹幕。 */
+    private fun inlineSegmentsOf(item: DanmakuItem): List<DanmakuInlineSegment>? =
+        item.inlineSegments
+            ?: run {
+                val parsed =
+                    DanmakuInlineParser.parse(
+                        text = item.data.text,
+                        liveEmotes = item.data.emotes,
+                        showHighLikeIcon = config.showHighLikeIcon,
+                        isHighLiked = item.data.isHighLiked,
+                    )
+                if (parsed != null && shouldCacheInlineSegments(item)) item.inlineSegments = parsed
+                parsed
+            }
+
+    private fun shouldCacheInlineSegments(item: DanmakuItem): Boolean {
+        val text = item.data.text
+        if (!item.data.emotes.isNullOrEmpty()) return true
+        return !text.contains('[') || ReplyEmotePanelRepository.version() > 0
+    }
+
+    /** 字形高（不含描边外扩），表情尺寸以它为基准。 */
+    private fun glyphHeightPx(metrics: Paint.FontMetrics): Float =
+        (metrics.descent - metrics.ascent).coerceAtLeast(1f)
+
+    private fun emoteSizePx(glyphHeightPx: Float, scale: Float): Float {
+        val s = if (scale.isFinite() && scale > 0f) scale else 1f
+        return (glyphHeightPx * s).coerceAtLeast(1f)
+    }
+
+    /** 跨轨道判定用的倍数：只认大表情（0 = 没有大表情，按单轨道处理）。 */
+    private fun maxLaneSpanScaleOf(item: DanmakuItem): Float =
+        DanmakuInlineParser.maxLaneSpanScale(inlineSegmentsOf(item))
+
+    /**
+     * 跨轨道用的底图高度：取文字盒高与大表情高的较大者。
+     * [maxScale] 由 [maxLaneSpanScaleOf] 给出，小表情不参与，因此没有大表情时恒等于文字盒高。
+     */
+    private fun contentBoxHeightPx(
+        outlinePad: Float,
+        maxScale: Float,
+    ): Float {
+        actionPaint.getFontMetrics(actionFontMetrics)
+        val glyphHeight = glyphHeightPx(actionFontMetrics)
+        val textBox = glyphHeight + outlinePad * 2f
+        if (maxScale <= 0f) return textBox
+        return max(textBox, emoteSizePx(glyphHeight, maxScale) + outlinePad * 2f)
+    }
+
+    private fun laneSpanFor(boxHeightPx: Float, laneHeight: Float): Int {
+        if (!boxHeightPx.isFinite() || boxHeightPx <= 0f) return 1
+        if (!laneHeight.isFinite() || laneHeight <= 0f) return 1
+        return ceil(boxHeightPx / laneHeight).toInt().coerceIn(1, MAX_LANE_SPAN)
     }
 
     private fun isScrollLaneAvailable(
@@ -1113,9 +1218,9 @@ internal class DanmakuEngine(
         }
         val text = item.data.text
         val width =
-            if (text.isBlank()) {
+            if (text.isBlank() && item.data.emotes.isNullOrEmpty()) {
                 outlinePad * 2f
-            } else if ((!config.showHighLikeIcon || !item.data.isHighLiked) && !text.contains('[')) {
+            } else if (!hasInlineCandidate(item)) {
                 actionPaint.measureText(text) + outlinePad * 2f
             } else {
                 measureTextWidthWithInlineSegments(item = item, paint = actionPaint, outlinePad = outlinePad)
@@ -1128,68 +1233,29 @@ internal class DanmakuEngine(
     private fun measureTextWidthWithInlineSegments(item: DanmakuItem, paint: Paint, outlinePad: Float): Float {
         val text = item.data.text
         paint.getFontMetrics(actionFontMetrics)
-        val emoteSizePx = (actionFontMetrics.descent - actionFontMetrics.ascent).coerceAtLeast(1f)
+        val glyphHeight = glyphHeightPx(actionFontMetrics)
+
+        val segments = inlineSegmentsOf(item)
+        if (segments == null) {
+            return paint.measureText(text) + outlinePad * 2f
+        }
 
         var w = 0f
-        if (config.showHighLikeIcon && item.data.isHighLiked) {
-            w += emoteSizePx + inlineIconGapPx(emoteSizePx)
-        }
-        if (!text.contains('[')) return w + paint.measureText(text) + outlinePad * 2f
-        var i = 0
-        while (i < text.length) {
-            val open = text.indexOf('[', startIndex = i)
-            if (open < 0) {
-                w += paint.measureText(text, i, text.length)
-                break
+        for (seg in segments) {
+            when (seg) {
+                is DanmakuInlineSegment.Text -> {
+                    if (seg.end > seg.start) w += paint.measureText(text, seg.start, seg.end)
+                }
+                is DanmakuInlineSegment.Emote -> {
+                    // 表情按方形占位（图未就绪时也能量出稳定宽度），边长 = 字形高 × 分段倍数
+                    w += emoteSizePx(glyphHeight, seg.scale)
+                }
+                DanmakuInlineSegment.HighLikeIcon -> {
+                    w += glyphHeight + inlineIconGapPx(glyphHeight)
+                }
             }
-            val close = text.indexOf(']', startIndex = open + 1)
-            if (close < 0) {
-                w += paint.measureText(text, i, text.length)
-                break
-            }
-            if (open > i) {
-                w += paint.measureText(text, i, open)
-            }
-            val token = text.substring(open, close + 1)
-            val url = ReplyEmotePanelRepository.urlForToken(token)
-            if (url != null && url.startsWith("http")) {
-                w += emoteSizePx
-            } else {
-                w += paint.measureText(text, open, close + 1)
-            }
-            i = close + 1
         }
         return w + outlinePad * 2f
-    }
-
-    private fun parseInlineSegments(item: DanmakuItem): List<DanmakuInlineSegment>? {
-        val text = item.data.text
-        var i = 0
-        var lastTextStart = 0
-        var hasInline = false
-        val out = ArrayList<DanmakuInlineSegment>(8)
-        if (config.showHighLikeIcon && item.data.isHighLiked) {
-            out.add(DanmakuInlineSegment.HighLikeIcon)
-            hasInline = true
-        }
-        while (i < text.length) {
-            val open = text.indexOf('[', startIndex = i)
-            if (open < 0) break
-            val close = text.indexOf(']', startIndex = open + 1)
-            if (close < 0) break
-            val token = text.substring(open, close + 1)
-            val url = ReplyEmotePanelRepository.urlForToken(token)
-            if (url != null && url.startsWith("http")) {
-                hasInline = true
-                if (open > lastTextStart) out.add(DanmakuInlineSegment.Text(start = lastTextStart, end = open))
-                out.add(DanmakuInlineSegment.Emote(url = url))
-                lastTextStart = close + 1
-            }
-            i = close + 1
-        }
-        if (!hasInline) return null
-        if (lastTextStart < text.length) out.add(DanmakuInlineSegment.Text(start = lastTextStart, end = text.length))
-        return out
     }
 
     private fun drawTextDirect(
@@ -1198,12 +1264,9 @@ internal class DanmakuEngine(
         x: Float,
         yTop: Float,
         outlinePad: Float,
-        baselineOffset: Float,
         opacityAlpha: Int,
-        emoteSizePx: Float,
     ) {
         val text = item.data.text
-        if (text.isBlank()) return
 
         val drawStrokeEnabled = strokeWidthPx > 0.01f
         val rgb = item.data.color and 0xFFFFFF
@@ -1213,26 +1276,33 @@ internal class DanmakuEngine(
         }
         drawFill.color = (opacityAlpha shl 24) or rgb
 
-        val textX = x + outlinePad
-        val baseline = yTop + baselineOffset
+        val glyphHeight = glyphHeightPx(drawFontMetrics)
+        val textBoxPx = glyphHeight + outlinePad * 2f
 
-        val segments =
-            item.inlineSegments
-                ?: run {
-                    val parsed = parseInlineSegments(item)
-                    if (parsed != null && shouldCacheInlineSegments(item)) item.inlineSegments = parsed
-                    parsed
-        }
+        val segments = if (hasInlineCandidate(item)) inlineSegmentsOf(item) else null
         if (segments == null) {
+            if (text.isBlank()) return
+            val baseline = yTop + outlinePad - drawFontMetrics.ascent
+            val textX = x + outlinePad
             if (drawStrokeEnabled) canvas.drawText(text, textX, baseline, drawStroke)
             canvas.drawText(text, textX, baseline, drawFill)
             return
         }
 
-        val emoteTop = yTop + outlinePad
-        val r = (emoteSizePx * 0.18f).coerceIn(2f, 10f)
-        val highLikeGapPx = inlineIconGapPx(emoteSizePx)
-        var cursorX = textX
+        // 底图高度取文字盒与最大表情的较大者；文字与表情都在盒内垂直居中。
+        // 没有大表情时 boxHeight == textBoxPx，和改造前的落点完全一致。
+        val maxScale = DanmakuInlineParser.maxEmoteScale(segments)
+        val boxPx =
+            if (maxScale > 0f) {
+                max(textBoxPx, emoteSizePx(glyphHeight, maxScale) + outlinePad * 2f)
+            } else {
+                textBoxPx
+            }
+        val baseline = yTop + (boxPx - textBoxPx) / 2f + outlinePad - drawFontMetrics.ascent
+
+        val r = (emoteSizePx(glyphHeight, maxScale.coerceAtLeast(1f)) * 0.18f).coerceIn(2f, 10f)
+        val highLikeGapPx = inlineIconGapPx(glyphHeight)
+        var cursorX = x + outlinePad
         for (seg in segments) {
             when (seg) {
                 is DanmakuInlineSegment.Text -> {
@@ -1243,30 +1313,28 @@ internal class DanmakuEngine(
                     }
                 }
                 is DanmakuInlineSegment.Emote -> {
+                    val size = emoteSizePx(glyphHeight, seg.scale)
+                    val top = yTop + (boxPx - size) / 2f
                     val bmp = EmoteBitmapLoader.getCached(seg.url)
-                    if (bmp != null) {
-                        emoteTmpRectF.set(cursorX, emoteTop, cursorX + emoteSizePx, emoteTop + emoteSizePx)
+                    if (bmp != null && !bmp.isRecycled) {
+                        emoteTmpRectF.set(cursorX, top, cursorX + size, top + size)
                         canvas.drawBitmap(bmp, null, emoteTmpRectF, emotePaint)
                     } else {
                         // Prefetch is throttled elsewhere (later step). For now, do a best-effort prefetch.
                         EmoteBitmapLoader.prefetch(seg.url)
-                        emoteTmpRectF.set(cursorX, emoteTop, cursorX + emoteSizePx, emoteTop + emoteSizePx)
+                        emoteTmpRectF.set(cursorX, top, cursorX + size, top + size)
                         canvas.drawRoundRect(emoteTmpRectF, r, r, emotePlaceholderFill)
                         canvas.drawRoundRect(emoteTmpRectF, r, r, emotePlaceholderStroke)
                     }
-                    cursorX += emoteSizePx
+                    cursorX += size
                 }
                 DanmakuInlineSegment.HighLikeIcon -> {
-                    drawInlineLikeIcon(cursorX, emoteTop, emoteSizePx, canvas, opacityAlpha)
-                    cursorX += emoteSizePx + highLikeGapPx
+                    val top = yTop + (boxPx - glyphHeight) / 2f
+                    drawInlineLikeIcon(cursorX, top, glyphHeight, canvas, opacityAlpha)
+                    cursorX += glyphHeight + highLikeGapPx
                 }
             }
         }
-    }
-
-    private fun shouldCacheInlineSegments(item: DanmakuItem): Boolean {
-        val text = item.data.text
-        return !text.contains('[') || ReplyEmotePanelRepository.version() > 0
     }
 
     private fun inlineIconGapPx(iconSizePx: Float): Float = (iconSizePx * 0.14f).coerceAtLeast(density * 2f)
@@ -1342,5 +1410,8 @@ internal class DanmakuEngine(
         private const val MAX_CACHE_REQUESTS_PER_FRAME = 8
         private const val MAX_CACHE_SCAN_PER_FRAME = 16
         private const val MAX_CACHE_QUEUE_DEPTH = 48
+
+        /** 单条弹幕最多占用的轨道数（大表情撑高底图时用）。 */
+        private const val MAX_LANE_SPAN = 3
     }
 }

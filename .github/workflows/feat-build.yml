@@ -1,0 +1,49 @@
+name: Feat Branch Build
+
+# 特性分支的轻量编译验证：只做 assembleDebug + 上传 artifact，
+# 不碰 Release / R2 / GitHub Release，避免污染正式发布流程。
+# （原有的三个工作流都是 workflow_dispatch 手动触发，这里不动它们。）
+on:
+  push:
+    branches:
+      - "feat/**"
+      - "fix/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-debug:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+          cache: "gradle"
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+      - name: Resolve version name
+        id: version
+        run: |
+          set -euo pipefail
+          # 取 CHANGELOG.md 里最新的版本标题（如 `## 0.1.29`），它就是这份源码对应的
+          # 上游发布版本；再拼上 CI 运行号作为预发布后缀，便于区分同版本的多次构建。
+          BASE=$(grep -m1 -oE '^#{1,6}[[:space:]]+\[?v?[0-9]+(\.[0-9]+)+' CHANGELOG.md \
+                 | grep -oE '[0-9]+(\.[0-9]+)+' || true)
+          BASE="${BASE:-0.0.0}"
+          echo "name=${BASE}-ci.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "resolved versionName = ${BASE}-ci.${GITHUB_RUN_NUMBER}"
+      - name: Build debug APK
+        # 只覆盖 versionName（加 -ci.<run> 后缀区分构建），versionCode 交给 gradle 从
+        # CHANGELOG 推导（0.1.29 → 129）。刻意不传 -PversionCode=run_number：run_number
+        # 是 1、2、3…这样的小数，会比本地直接 Build 出来的 versionCode 小，导致
+        # 「电视上装过本地包之后，CI 包装不上去」（系统按 versionCode 判版本降级）。
+        run: ./gradlew assembleDebug -PversionName=${{ steps.version.outputs.name }} --stacktrace
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk

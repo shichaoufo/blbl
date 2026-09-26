@@ -1,10 +1,25 @@
 name: Android Release
 
+# 正式发布：编译 release APK 并发布到 GitHub Releases。
+#
+# 两种触发方式：
+#   1. push tag（如 `git push origin v0.1.30`）—— 版本号直接取 tag 名；
+#   2. 手动 Run workflow —— 自己填 version_name。
+#
+# 签名：优先用仓库 secrets 里的正式 keystore；没配就回退到 CI 临时生成的密钥，
+# 这样 workflow 始终能跑通（临时密钥每次不同，装的时候需要先卸载旧包）。
+# 若要固定签名，往仓库 secrets 里放这四个即可：
+#   RELEASE_KEYSTORE_BASE64（keystore 的 base64）、RELEASE_STORE_PASSWORD、
+#   RELEASE_KEY_ALIAS、RELEASE_KEY_PASSWORD
+
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       version_name:
-        description: "Version name (e.g. 0.1.1)"
+        description: "Version name (e.g. 0.1.30)"
         required: true
       changelog:
         description: "Release notes/changelog (optional; supports multiline)"
@@ -26,89 +41,87 @@ jobs:
           cache: "gradle"
       - name: Grant execute permission for gradlew
         run: chmod +x ./gradlew
-      - name: Decode keystore
-        run: |
-          mkdir -p keystore
-          echo "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" | base64 -d > keystore/release.keystore
-      - name: Build release APK
-        env:
-          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
-          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
-          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
-        run: ./gradlew assembleRelease -PversionName=${{ inputs.version_name }} -PversionCode=${{ github.run_number }}
-      - name: Upload release APK to R2 (optional)
-        env:
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID || vars.R2_ACCOUNT_ID }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET || vars.R2_BUCKET }}
-          R2_PREFIX: ${{ vars.R2_PREFIX || secrets.R2_PREFIX }}
-          VERSION_NAME: ${{ inputs.version_name }}
+
+      - name: Resolve version name
+        id: version
         run: |
           set -euo pipefail
-          if [ -z "${R2_ACCESS_KEY_ID:-}" ] || [ -z "${R2_SECRET_ACCESS_KEY:-}" ] || [ -z "${R2_ACCOUNT_ID:-}" ] || [ -z "${R2_BUCKET:-}" ]; then
-            echo "R2 variables not set, skipping upload."
-            exit 0
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            RAW="${GITHUB_REF_NAME}"
+          elif [ -n "${{ inputs.version_name }}" ]; then
+            RAW="${{ inputs.version_name }}"
+          else
+            RAW="$(grep -m1 -oP '^## \K[0-9.]+' CHANGELOG.md)"
           fi
-          if ! command -v aws >/dev/null 2>&1; then
-            echo "aws cli not found, installing..."
-            sudo apt-get update
-            sudo apt-get install -y awscli
-          fi
-
-          export AWS_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}"
-          export AWS_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}"
-          export AWS_REGION="auto"
-          export AWS_EC2_METADATA_DISABLED=true
-          ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-
-          CLEAN_VERSION="${VERSION_NAME#v}"
-          KEY_PREFIX="${R2_PREFIX:-blbl}"
-          KEY_PREFIX="${KEY_PREFIX%/}"
-          if [ -n "${KEY_PREFIX}" ]; then
-            KEY_PREFIX="${KEY_PREFIX}/"
-          fi
-          if [ ! -s CHANGELOG.md ]; then
-            echo "CHANGELOG.md missing or empty."
+          CLEAN="${RAW#v}"
+          if [ -z "$CLEAN" ]; then
+            echo "无法解析版本号" >&2
             exit 1
           fi
+          echo "version=$CLEAN" >> "$GITHUB_OUTPUT"
+          echo "构建版本：$CLEAN"
 
-          printf '%s' "${CLEAN_VERSION}" > version
-          aws s3 cp "version" "s3://${R2_BUCKET}/${KEY_PREFIX}version" --endpoint-url "${ENDPOINT}" --content-type "text/plain" --cache-control "no-cache"
-          aws s3 cp "CHANGELOG.md" "s3://${R2_BUCKET}/${KEY_PREFIX}CHANGELOG.md" --endpoint-url "${ENDPOINT}" --content-type "text/markdown; charset=utf-8" --cache-control "no-cache"
-          aws s3 cp "app/build/outputs/apk/release/app-release.apk" "s3://${R2_BUCKET}/${KEY_PREFIX}blbl-${CLEAN_VERSION}-release.apk" --endpoint-url "${ENDPOINT}" --content-type "application/vnd.android.package-archive"
-          aws s3 cp "app/build/outputs/apk/release/app-release.apk" "s3://${R2_BUCKET}/${KEY_PREFIX}blbl-latest-release.apk" --endpoint-url "${ENDPOINT}" --content-type "application/vnd.android.package-archive" --cache-control "no-cache"
+      - name: Decode keystore
+        env:
+          KS_B64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          STORE_PW: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          KEY_PW: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p keystore
+          if [ -n "${KS_B64:-}" ] && [ -n "${STORE_PW:-}" ] && [ -n "${KEY_ALIAS:-}" ]; then
+            echo "使用仓库 secrets 里的正式 keystore"
+            printf '%s' "$KS_B64" | base64 -d > keystore/release.keystore
+            echo "RELEASE_STORE_PASSWORD=$STORE_PW" >> "$GITHUB_ENV"
+            echo "RELEASE_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "RELEASE_KEY_PASSWORD=$KEY_PW" >> "$GITHUB_ENV"
+          else
+            echo "::warning::未配置 RELEASE_KEYSTORE_BASE64，改用 CI 临时密钥签名（每次签名不同，安装前需卸载旧包）"
+            keytool -genkeypair -v \
+              -keystore keystore/release.keystore \
+              -alias blbl-animate \
+              -keyalg RSA -keysize 2048 -validity 10950 \
+              -storepass android -keypass android \
+              -dname "CN=blbl-animate, OU=blbl, O=blbl-animate, L=, S=, C=CN"
+            echo "RELEASE_STORE_PASSWORD=android" >> "$GITHUB_ENV"
+            echo "RELEASE_KEY_ALIAS=blbl-animate" >> "$GITHUB_ENV"
+            echo "RELEASE_KEY_PASSWORD=android" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build release APK
+        run: ./gradlew assembleRelease -PversionName=${{ steps.version.outputs.version }} -PversionCode=${{ github.run_number }}
+
       - name: Prepare named release APK
         env:
-          VERSION_NAME: ${{ inputs.version_name }}
+          VERSION_NAME: ${{ steps.version.outputs.version }}
         run: |
-          CLEAN_VERSION="${VERSION_NAME#v}"
-          DOWNLOAD_APK="app/build/outputs/apk/release/blbl-android-${CLEAN_VERSION}-release.apk"
-          cp "app/build/outputs/apk/release/app-release.apk" "${DOWNLOAD_APK}"
-          echo "DOWNLOAD_APK=${DOWNLOAD_APK}" >> "${GITHUB_ENV}"
-      - name: Upload release APK
+          set -euo pipefail
+          OUT="app/build/outputs/apk/release/blbl-animate-${VERSION_NAME}-release.apk"
+          cp "app/build/outputs/apk/release/app-release.apk" "$OUT"
+          echo "DOWNLOAD_APK=$OUT" >> "$GITHUB_ENV"
+
+      - name: Upload release APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: blbl-android-${{ inputs.version_name }}-release
+          name: blbl-animate-${{ steps.version.outputs.version }}-release
           path: ${{ env.DOWNLOAD_APK }}
-      - name: Publish release APK to GitHub Release
+
+      - name: Publish to GitHub Releases
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION_NAME: ${{ inputs.version_name }}
-          RELEASE_TAG: ${{ startsWith(inputs.version_name, 'v') && inputs.version_name || format('v{0}', inputs.version_name) }}
+          VERSION_NAME: ${{ steps.version.outputs.version }}
+          RELEASE_TAG: v${{ steps.version.outputs.version }}
           CHANGELOG: ${{ inputs.changelog }}
         run: |
+          set -euo pipefail
+          if [ -z "${CHANGELOG:-}" ]; then
+            CHANGELOG="$(sed -n "/^## ${VERSION_NAME}\$/,/^## /p" CHANGELOG.md | sed '1d;$d' | sed '/^$/d')"
+          fi
+          printf '%s' "$CHANGELOG" > changelog.md
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            if [ -n "${CHANGELOG:-}" ]; then
-              printf '%s' "$CHANGELOG" > changelog.md
-              gh release edit "$RELEASE_TAG" --notes-file changelog.md
-            fi
+            gh release edit "$RELEASE_TAG" --notes-file changelog.md
           else
-            if [ -n "${CHANGELOG:-}" ]; then
-              printf '%s' "$CHANGELOG" > changelog.md
-              gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --notes-file changelog.md --target "$GITHUB_SHA"
-            else
-              gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes --target "$GITHUB_SHA"
-            fi
+            gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --notes-file changelog.md --target "$GITHUB_SHA"
           fi
           gh release upload "$RELEASE_TAG" "$DOWNLOAD_APK" --clobber

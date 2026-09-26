@@ -50,5 +50,62 @@ class DanmakuTimerTest {
         assertTrue(position >= timer.currentPositionMs())
     }
 
+    /**
+     * 位移是否顺滑，第一个前提是喂进来的时间戳等距。
+     *
+     * 旧实现把 onDraw 里现取的 System.nanoTime() 交给 [DanmakuTimer]；onDraw 相对
+     * vsync 有一份随 View 树遍历工作量浮动的偏移（毫秒级），逐帧 dt 因此时大时小，
+     * 位置步长跟着忽长忽短。时间轴改由 [PresentationClock] 按帧回调上报的 vsync
+     * 时间戳之差推进后，dt 恒等于真实帧间隔 —— 下面用同一套平滑逻辑跑两种输入，
+     * 把差异量化出来。
+     *
+     * 注意这只是必要条件：位置本身还必须保留亚毫秒精度，否则恒定的 dt 会被量化成
+     * 周期性步长，反而比随机抖动更刺眼（见 DanmakuScrollMathTest）。
+     */
+    @Test
+    fun uniformFrameTimestampsProduceUniformMotion() {
+        val steady = motionDeltasMs(jitterNs = 0L)
+        val jittered = motionDeltasMs(jitterNs = 3_000_000L)
+
+        assertEquals(0L, spread(steady))
+        assertTrue(
+            "采样时刻抖动应明显破坏位移均匀性：steady=${spread(steady)} jittered=${spread(jittered)}",
+            spread(jittered) > spread(steady) + 5L,
+        )
+    }
+
+    /**
+     * 按 [periodNs] 逐帧推进；[jitterNs] 模拟 onDraw 相对 vsync 的浮动偏移（正负交替）。
+     * 返回逐帧位置增量（ms）。
+     */
+    private fun motionDeltasMs(
+        periodNs: Long = 10_000_000L,
+        frames: Int = 24,
+        jitterNs: Long = 0L,
+    ): List<Long> {
+        val timer = DanmakuTimer()
+        val deltas = ArrayList<Long>(frames)
+        var elapsedNs = 0L
+        var lastPosition = 0L
+        for (i in 0 until frames) {
+            elapsedNs += periodNs
+            val offset = if (i % 2 == 0) jitterNs else -jitterNs
+            val position =
+                timer.step(
+                    nowNanos = elapsedNs + offset,
+                    rawPositionMs = elapsedNs / 1_000_000L,
+                    isPlaying = true,
+                    playbackSpeed = 1f,
+                    seekSerial = 0,
+                )
+            if (i > 0) deltas.add(position - lastPosition)
+            lastPosition = position
+        }
+        return deltas
+    }
+
+    private fun spread(values: List<Long>): Long =
+        if (values.isEmpty()) 0L else (values.maxOrNull() ?: 0L) - (values.minOrNull() ?: 0L)
+
     private fun ns(milliseconds: Long): Long = milliseconds * 1_000_000L + 1L
 }

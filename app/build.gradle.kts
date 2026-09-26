@@ -4,6 +4,40 @@ plugins {
     id("com.google.protobuf")
 }
 
+/**
+ * 当前代码对应的版本号，取自 `CHANGELOG.md` 里最新的版本标题（如 `## 0.1.29`）。
+ *
+ * 该标题与上游的 git tag / Release（`v0.1.29`）一一对应，所以它就是这份源码的真实版本。
+ * 这里原先的兜底值是写死的 `"0.1.0"`：本地直接 Build（Android Studio 或裸 `./gradlew`）
+ * 不传 `-PversionName` 时，APK 就会带着一个与真实版本无关的旧号 ——
+ * 系统「应用信息」里看不到真实版本，App 内「检查更新」也会拿它去和上游比较。
+ */
+val changelogVersionName: String =
+    Regex("""^#{1,6}\s+\[?v?(\d+(?:\.\d+)+)""", RegexOption.MULTILINE)
+        .find(rootProject.file("CHANGELOG.md").takeIf { it.isFile }?.readText(Charsets.UTF_8).orEmpty())
+        ?.groupValues
+        ?.get(1)
+        ?.takeIf { it.isNotBlank() }
+        ?: "0.0.0"
+
+/**
+ * 由 [changelogVersionName] 推导的 versionCode（`0.1.29` → `129`）。
+ *
+ * 只用于本地直接 Build 时的兜底：CI 与正式发布流程会显式传 `-PversionCode`（上游用
+ * GitHub run_number）。取这个基数是为了让本地包比 CI 的 run_number 大，避免
+ * 「装过 CI 包之后再装本地包」被系统判为版本降级而拒绝安装。
+ */
+val changelogVersionCode: Int =
+    Regex("""^(\d+)(?:\.(\d+))?(?:\.(\d+))?""")
+        .find(changelogVersionName)
+        ?.let { m ->
+            val major = m.groupValues[1].toIntOrNull() ?: 0
+            val minor = m.groupValues[2].toIntOrNull() ?: 0
+            val patch = m.groupValues[3].toIntOrNull() ?: 0
+            major * 10_000 + minor * 100 + patch
+        }
+        ?: 1
+
 android {
     namespace = "blbl.cat3399"
     compileSdk = 36
@@ -20,8 +54,10 @@ android {
         applicationId = "blbl.cat3399"
         minSdk = 21
         targetSdk = 36
-        versionCode = (project.findProperty("versionCode") as String?)?.toInt() ?: 1
-        versionName = project.findProperty("versionName") as String? ?: "0.1.0"
+        // 版本号优先级：-PversionName / versionCode（CI 与正式发布流程传参）
+        //   → CHANGELOG.md 推导出的真实版本（本地直接 Build 走这条）→ 兜底值。
+        versionCode = propOrEnv("versionCode")?.toIntOrNull() ?: changelogVersionCode
+        versionName = propOrEnv("versionName") ?: changelogVersionName
 
         vectorDrawables {
             useSupportLibrary = true
@@ -139,6 +175,9 @@ dependencies {
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
+    // 单测里需要真实可用的 org.json：android.jar 中的 org.json 在 JVM 单测下是
+    // 抛异常的空桩（"not mocked"），解析 DANMU_MSG 表情的回归测试需要它。
+    testImplementation("org.json:json:20240303")
 }
 
 // Enforce theme-token usage in layouts so adding new theme presets doesn't silently break contrast.

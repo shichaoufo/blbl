@@ -446,7 +446,14 @@ class SettingsRenderer(
 
             "其他设置" ->
                 listOf(
-                    SettingEntry(SettingId.PlayerRenderView, "渲染视图", SettingsText.renderViewText(prefs.playerRenderViewType), null),
+                    SettingEntry(
+                        SettingId.PlayerRenderView,
+                        "渲染视图",
+                        SettingsText.renderViewText(prefs.playerRenderViewType),
+                        "默认 TextureView：视频走应用绘制，弹幕不会被合成器拉去「等视频帧」。" +
+                            "SurfaceView 走独立硬件层、更省电，但部分电视会把 UI 的 vsync 对齐到视频层，" +
+                            "令弹幕一顿一窜。改用后再进播放才生效",
+                    ),
                     SettingEntry(SettingId.PlayerEngineKind, "播放器内核", SettingsText.playerEngineText(prefs.playerEngineKind), null),
                     SettingEntry(
                         SettingId.PlayerCustomShortcuts,
@@ -497,21 +504,12 @@ class SettingsRenderer(
                 )
 
             "关于应用" ->
-                listOf(
+                listOfNotNull(
                     SettingEntry(SettingId.AppVersion, "版本", BuildConfig.VERSION_NAME, null),
                     SettingEntry(SettingId.ProjectUrl, "项目地址", SettingsConstants.PROJECT_URL, null),
-                    SettingEntry(SettingId.QqGroup, "QQ交流群", SettingsConstants.QQ_GROUP, null),
                     SettingEntry(SettingId.LogTag, "日志标签", "BLBL", "用于 Logcat 过滤"),
                     SettingEntry(SettingId.ExportLogs, "导出日志", "保存文件", null),
-                    SettingEntry(SettingId.UploadLogs, "上传日志", "点击上传", "打包并上传日志zip到开发者（含设备/版本/非登录配置元数据）"),
                     playerKernelEntry(),
-                    SettingEntry(
-                        SettingId.AutoUpdateCheckEnabled,
-                        "自动检查更新",
-                        if (prefs.autoUpdateCheckEnabled) "开" else "关",
-                        "启动时后台检查，有新版本才提示",
-                    ),
-                    aboutUpdateEntry(),
                 )
 
             "设备信息" ->
@@ -568,33 +566,6 @@ class SettingsRenderer(
     private fun cacheSizeText(): String {
         val size = state.cacheSizeBytes ?: return "-"
         return SettingsText.formatBytes(size)
-    }
-
-    private fun aboutUpdateEntry(): SettingEntry {
-        val currentVersion = BuildConfig.VERSION_NAME
-        val title = "检查更新"
-        val defaultDesc = "检查新版本并下载安装"
-        return when (val checkState = state.testUpdateCheckState) {
-            TestUpdateCheckState.Idle -> SettingEntry(SettingId.CheckUpdate, title, "点击检查", defaultDesc)
-            TestUpdateCheckState.Checking -> SettingEntry(SettingId.CheckUpdate, title, "检查中…", "正在获取更新日志…")
-
-            is TestUpdateCheckState.Latest ->
-                SettingEntry(
-                    SettingId.CheckUpdate,
-                    title,
-                    "已是最新版",
-                    "当前：$currentVersion / 最新：${checkState.latestVersion}",
-                )
-
-            is TestUpdateCheckState.UpdateAvailable ->
-                SettingEntry(SettingId.CheckUpdate, title, "新版本 ${checkState.latestVersion}", "当前：$currentVersion，点击更新")
-
-            is TestUpdateCheckState.Error -> {
-                val msg = checkState.message.trim().take(80)
-                val desc = if (msg.isBlank()) "检查失败，点击重试" else "检查失败，点击重试（$msg）"
-                SettingEntry(SettingId.CheckUpdate, title, "检查失败", desc)
-            }
-        }
     }
 
     private fun focusRightById(id: SettingId): Boolean {

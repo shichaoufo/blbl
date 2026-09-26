@@ -26,7 +26,6 @@ import blbl.cat3399.core.io.CreateDocumentRequest
 import blbl.cat3399.core.io.DocumentExporter
 import blbl.cat3399.core.log.AppLog
 import blbl.cat3399.core.log.LogExporter
-import blbl.cat3399.core.log.LogUploadClient
 import blbl.cat3399.core.net.BiliClient
 import blbl.cat3399.core.prefs.AppConfigBackup
 import blbl.cat3399.core.prefs.AppPrefs
@@ -42,8 +41,6 @@ import blbl.cat3399.core.ui.Immersive
 import blbl.cat3399.core.ui.popup.AppPopup
 import blbl.cat3399.core.ui.popup.PopupAction
 import blbl.cat3399.core.ui.popup.PopupActionRole
-import blbl.cat3399.core.update.ApkUpdateFlow
-import blbl.cat3399.core.update.ApkUpdater
 import blbl.cat3399.feature.player.engine.IjkPlayerPlugin
 import blbl.cat3399.feature.player.engine.IjkPlayerPluginUi
 import blbl.cat3399.feature.player.AudioBalanceLevel
@@ -93,6 +90,7 @@ class SettingsInteractionHandler(
     private var testUpdateCheckJob: Job? = null
     private var exportLogsJob: Job? = null
     private var uploadLogsJob: Job? = null
+    private var lanUploadLogsJob: Job? = null
     private var clearCacheJob: Job? = null
     private var cacheSizeJob: Job? = null
     private var configTransferJob: Job? = null
@@ -101,7 +99,6 @@ class SettingsInteractionHandler(
     fun onSectionShown(sectionName: String) {
         when (sectionName) {
             "通用设置" -> updateCacheSize(force = false)
-            "关于应用" -> ensureTestUpdateChecked(force = false, refreshUi = false)
         }
     }
 
@@ -175,6 +172,17 @@ class SettingsInteractionHandler(
             }
     }
 
+    /**
+     * 打包日志并直推到局域网 FTP（路由器），随后电脑从路由器取回。
+     *
+     * 为什么需要它：电视上没有可用的「保存文件」选择器，导出的 zip 只能落到
+     * `Android/data/blbl.cat3399/files/exports/`，而 Android 11+ 又屏蔽了这个目录，
+     * 文件管理器进不去、也没有 adb 可用。FTP 是唯一「不需要改防火墙、也不需要拷文件」
+     * 的路子：路由器是双方都能主动连接的第三方。
+     *
+     * 打包用的是与「导出日志」完全相同的 [LogExporter.exportToLocalFile]，
+     * 因此 zip 内容（含 meta.json）与手动导出一致。
+     */
     private fun showConfigTransferDialog() {
         AppPopup.custom(
             context = activity,
@@ -358,188 +366,9 @@ class SettingsInteractionHandler(
         }
     }
 
-    private fun showUploadLogsDialog() {
-        if (uploadLogsJob?.isActive == true) {
-            AppToast.show(activity, "正在上传…")
-            return
-        }
-
-        AppPopup.confirm(
-            context = activity,
-            title = "上传日志",
-            message =
-                "将日志上传给开发者便于排查问题。\n\n" +
-                    "会随日志附带设备、版本、屏幕和非登录配置元数据，不包含登录 Cookie。\n\n" +
-                    "反馈问题时请带上上传成功后显示的文件名。",
-            positiveText = "上传",
-            negativeText = "取消",
-            cancelable = true,
-            onPositive = { startUploadLogs() },
-        )
-    }
-
-    private fun startUploadLogs() {
-        uploadLogsJob?.cancel()
-        val popup =
-            AppPopup.progress(
-                context = activity,
-                title = "上传日志",
-                status = "准备中…",
-                negativeText = "取消",
-                cancelable = false,
-                onNegative = { uploadLogsJob?.cancel() },
-            )
-
-        uploadLogsJob =
-            activity.lifecycleScope.launch {
-                var exportedFile: File? = null
-                try {
-                    val nowMs = System.currentTimeMillis()
-                    val deviceUuid = BiliClient.prefs.deviceUuid
-                    val epochSeconds = (nowMs / 1000L).coerceAtLeast(0L)
-                    val deviceId8 = deviceUuid.replace("-", "").take(8).ifBlank { "unknown00" }
-                    val fileName = "${epochSeconds}-${deviceId8}.zip"
-                    val metaJson = buildUploadMetaJson(nowMs = nowMs, deviceUuid = deviceUuid)
-
-                    popup?.updateProgress(null)
-                    popup?.updateStatus("打包中…")
-                    val export =
-                        withContext(Dispatchers.IO) {
-                            LogExporter.exportToLocalFile(
-                                context = activity,
-                                nowMs = nowMs,
-                                fileNameOverride = fileName,
-                                extras =
-                                    listOf(
-                                        LogExporter.ZipExtra(
-                                            path = "meta.json",
-                                            bytes = metaJson.toByteArray(Charsets.UTF_8),
-                                        ),
-                                    ),
-                            )
-                        }
-                    exportedFile = export.file
-
-                    currentCoroutineContext().ensureActive()
-                    popup?.updateProgress(0)
-                    popup?.updateStatus("上传中… 0%")
-                    var lastPct = -1
-                    var lastUpdateAtMs = 0L
-                    withContext(Dispatchers.IO) {
-                        LogUploadClient.uploadZip(
-                            file = export.file,
-                            fileName = export.fileName,
-                            onProgress = { sentBytes, totalBytes ->
-                                if (totalBytes <= 0L) return@uploadZip
-                                val pct = ((sentBytes.coerceAtLeast(0L) * 100L) / totalBytes).toInt().coerceIn(0, 100)
-                                val now = System.currentTimeMillis()
-                                if (pct == lastPct && now - lastUpdateAtMs < 80L) return@uploadZip
-                                lastPct = pct
-                                lastUpdateAtMs = now
-                                val hint = "${SettingsText.formatBytes(sentBytes)}/${SettingsText.formatBytes(totalBytes)}"
-                                popup?.updateProgress(pct)
-                                popup?.updateStatus("上传中… ${pct}% $hint")
-                            },
-                        )
-                    }
-
-                    popup?.dismiss()
-                    showUploadLogsSuccessPopup(
-                        fileName = export.fileName,
-                    )
-                } catch (_: CancellationException) {
-                    popup?.dismiss()
-                } catch (t: Throwable) {
-                    popup?.dismiss()
-                    AppLog.w("Settings", "upload logs failed", t)
-                    val msg = t.message?.takeIf { it.isNotBlank() } ?: "未知错误"
-                    AppToast.showLong(activity, "上传失败：$msg")
-                } finally {
-                    withContext(NonCancellable + Dispatchers.IO) {
-                        exportedFile?.let { runCatching { it.delete() } }
-                    }
-                }
-            }
-    }
-
-    private fun showUploadLogsSuccessPopup(
-        fileName: String,
-    ) {
-        val body = "文件：$fileName"
-
-        AppPopup.custom(
-            context = activity,
-            title = "上传成功",
-            cancelable = true,
-            actions =
-                listOf(
-                    PopupAction(role = PopupActionRole.NEGATIVE, text = "关闭"),
-                    PopupAction(role = PopupActionRole.NEUTRAL, text = "复制文件名") {
-                        copyToClipboard(label = "日志文件名", text = fileName, toastText = "已复制文件名")
-                    },
-                ),
-            preferredActionRole = PopupActionRole.NEUTRAL,
-            content = { dialogContext ->
-                val tv =
-                    android.view.LayoutInflater.from(dialogContext)
-                        .inflate(blbl.cat3399.R.layout.view_popup_message, null, false) as TextView
-                tv.text = body
-                tv
-            },
-        )
-    }
-
     private fun formatUploadTimestamp(nowMs: Long): String {
         val sdf = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US)
         return runCatching { sdf.format(Date(nowMs)) }.getOrNull()?.takeIf { it.isNotBlank() } ?: nowMs.toString()
-    }
-
-    private fun buildUploadMetaJson(
-        nowMs: Long,
-        deviceUuid: String,
-    ): String {
-        val tzId = runCatching { java.util.TimeZone.getDefault().id }.getOrNull().orEmpty()
-        val locale = runCatching { Locale.getDefault() }.getOrNull()
-        val localeTag = runCatching { locale?.toLanguageTag() }.getOrNull().orEmpty()
-        val prefs = BiliClient.prefs
-
-        val json =
-            JSONObject()
-                .put("schema", 1)
-                .put("device_uuid", deviceUuid)
-                .put("export_at_ms", nowMs)
-                .put("export_at", formatUploadTimestamp(nowMs))
-                .put("time_zone", tzId)
-                .put("locale", localeTag)
-                .put(
-                    "app",
-                    JSONObject()
-                        .put("package", BuildConfig.APPLICATION_ID)
-                        .put("version_name", BuildConfig.VERSION_NAME)
-                        .put("version_code", BuildConfig.VERSION_CODE)
-                        .put("build_type", BuildConfig.BUILD_TYPE)
-                        .put("debug", BuildConfig.DEBUG),
-                )
-                .put(
-                    "device",
-                    JSONObject()
-                        .put("manufacturer", Build.MANUFACTURER)
-                        .put("model", Build.MODEL)
-                        .put("sdk_int", Build.VERSION.SDK_INT)
-                        .put("release", Build.VERSION.RELEASE)
-                        .put("abi", Build.SUPPORTED_ABIS.firstOrNull().orEmpty())
-                        .put("ram", SettingsText.ramText(activity))
-                        .put("hardware_decoder", SettingsText.hardDecoderSupportText()),
-                )
-                .put(
-                    "account",
-                    JSONObject()
-                        .put("is_logged_in", BiliClient.cookies.hasSessData()),
-                )
-                .put("screen", buildUploadScreenJson())
-                .put("prefs_snapshot", prefs.exportDiagnosticsSnapshotJson())
-
-        return json.toString(2)
     }
 
     private fun buildUploadScreenJson(): JSONObject {
@@ -587,9 +416,57 @@ class SettingsInteractionHandler(
             )
     }
 
+    private fun buildLogMetaJson(
+        nowMs: Long,
+        deviceUuid: String,
+    ): String {
+        val tzId = runCatching { java.util.TimeZone.getDefault().id }.getOrNull().orEmpty()
+        val locale = runCatching { Locale.getDefault() }.getOrNull()
+        val localeTag = runCatching { locale?.toLanguageTag() }.getOrNull().orEmpty()
+        val prefs = BiliClient.prefs
+
+        val json =
+            JSONObject()
+                .put("schema", 1)
+                .put("device_uuid", deviceUuid)
+                .put("export_at_ms", nowMs)
+                .put("export_at", formatUploadTimestamp(nowMs))
+                .put("time_zone", tzId)
+                .put("locale", localeTag)
+                .put(
+                    "app",
+                    JSONObject()
+                        .put("package", BuildConfig.APPLICATION_ID)
+                        .put("version_name", BuildConfig.VERSION_NAME)
+                        .put("version_code", BuildConfig.VERSION_CODE)
+                        .put("build_type", BuildConfig.BUILD_TYPE)
+                        .put("debug", BuildConfig.DEBUG),
+                )
+                .put(
+                    "device",
+                    JSONObject()
+                        .put("manufacturer", Build.MANUFACTURER)
+                        .put("model", Build.MODEL)
+                        .put("sdk_int", Build.VERSION.SDK_INT)
+                        .put("release", Build.VERSION.RELEASE)
+                        .put("abi", Build.SUPPORTED_ABIS.firstOrNull().orEmpty())
+                        .put("ram", SettingsText.ramText(activity))
+                        .put("hardware_decoder", SettingsText.hardDecoderSupportText()),
+                )
+                .put(
+                    "account",
+                    JSONObject()
+                        .put("is_logged_in", BiliClient.cookies.hasSessData()),
+                )
+                .put("screen", buildUploadScreenJson())
+                .put("prefs_snapshot", prefs.exportDiagnosticsSnapshotJson())
+
+        return json.toString(2)
+    }
+
     private fun prepareLogsExport(nowMs: Long = System.currentTimeMillis()): PreparedLogsExport {
         val deviceUuid = BiliClient.prefs.deviceUuid
-        val metaJson = buildUploadMetaJson(nowMs = nowMs, deviceUuid = deviceUuid)
+        val metaJson = buildLogMetaJson(nowMs = nowMs, deviceUuid = deviceUuid)
         return PreparedLogsExport(
             fileName = LogExporter.suggestExportFileName(nowMs = nowMs),
             nowMs = nowMs,
@@ -749,16 +626,6 @@ class SettingsInteractionHandler(
                     onFallbackToLocal = { exportLogsToLocalFile(prepared) },
                     logTag = "logs",
                 )
-            }
-
-            SettingId.UploadLogs -> {
-                showUploadLogsDialog()
-            }
-
-            SettingId.AutoUpdateCheckEnabled -> {
-                prefs.autoUpdateCheckEnabled = !prefs.autoUpdateCheckEnabled
-                AppToast.show(activity, "自动检查更新：${if (prefs.autoUpdateCheckEnabled) "开" else "关"}")
-                renderer.refreshSection(entry.id)
             }
 
             SettingId.FullscreenEnabled -> {
@@ -1575,28 +1442,6 @@ class SettingsInteractionHandler(
 
             SettingId.ProjectUrl -> showProjectDialog()
 
-            SettingId.QqGroup -> {
-                copyToClipboard(label = "QQ交流群", text = SettingsConstants.QQ_GROUP, toastText = "已复制群号：${SettingsConstants.QQ_GROUP}")
-            }
-
-            SettingId.PlayerKernelCheck -> handlePlayerKernelCheck()
-
-            SettingId.CheckUpdate -> {
-                when (val checkState = state.testUpdateCheckState) {
-                    TestUpdateCheckState.Checking -> {
-                        AppToast.show(activity, "正在检查更新…")
-                    }
-
-                    is TestUpdateCheckState.UpdateAvailable -> {
-                        ApkUpdateFlow.showUpdatePrompt(activity, checkState.update) { selectedUpdate ->
-                            startTestUpdateDownload(selectedUpdate.versionName)
-                        }
-                    }
-
-                    else -> ensureTestUpdateChecked(force = true, refreshUi = true, promptIfUpdate = true)
-                }
-            }
-
             else -> AppLog.i("Settings", "click id=${entry.id.key} title=${entry.title}")
         }
     }
@@ -1632,7 +1477,6 @@ class SettingsInteractionHandler(
         runCatching { BiliClient.apiOkHttp.connectionPool.evictAll() }
         runCatching { BiliClient.cdnOkHttp.connectionPool.evictAll() }
         runCatching { BiliClient.appCdnOkHttp.connectionPool.evictAll() }
-        runCatching { ApkUpdater.evictConnections() }
     }
 
     private fun showChoiceDialog(title: String, items: List<String>, current: String, onPicked: (String) -> Unit) {
@@ -2763,71 +2607,6 @@ class SettingsInteractionHandler(
             }
         }
         return total.coerceAtLeast(0L)
-    }
-
-    private fun ensureTestUpdateChecked(force: Boolean, refreshUi: Boolean = true, promptIfUpdate: Boolean = false) {
-        if (testUpdateJob?.isActive == true) return
-        if (testUpdateCheckJob?.isActive == true) return
-        if (state.testUpdateCheckState is TestUpdateCheckState.Checking) return
-
-        val now = System.currentTimeMillis()
-        val last = state.testUpdateCheckedAtMs
-        val hasFreshResult =
-            !force &&
-                last > 0 &&
-                now - last < SettingsConstants.UPDATE_CHECK_TTL_MS &&
-                state.testUpdateCheckState !is TestUpdateCheckState.Idle &&
-                state.testUpdateCheckState !is TestUpdateCheckState.Checking
-        if (hasFreshResult) return
-
-        state.testUpdateCheckState = TestUpdateCheckState.Checking
-        if (refreshUi) renderer.refreshAboutSectionKeepPosition()
-
-        testUpdateCheckJob =
-            activity.lifecycleScope.launch {
-                try {
-                    val update = ApkUpdater.fetchLatestUpdate()
-                    val latest = update.versionName
-                    val current = BuildConfig.VERSION_NAME
-                    state.testUpdateCheckState =
-                        if (ApkUpdater.isRemoteNewer(latest, current)) {
-                            TestUpdateCheckState.UpdateAvailable(update)
-                        } else {
-                            TestUpdateCheckState.Latest(latest)
-                        }
-                    state.testUpdateCheckedAtMs = System.currentTimeMillis()
-                    if (promptIfUpdate && state.testUpdateCheckState is TestUpdateCheckState.UpdateAvailable) {
-                        ApkUpdateFlow.showUpdatePrompt(activity, update) { selectedUpdate ->
-                            startTestUpdateDownload(selectedUpdate.versionName)
-                        }
-                    }
-                } catch (_: CancellationException) {
-                    return@launch
-                } catch (t: Throwable) {
-                    state.testUpdateCheckState = TestUpdateCheckState.Error(t.message ?: "检查失败")
-                    state.testUpdateCheckedAtMs = System.currentTimeMillis()
-                }
-                renderer.refreshAboutSectionKeepPosition()
-            }
-    }
-
-    private fun startTestUpdateDownload(latestVersionHint: String? = null) {
-        if (testUpdateJob?.isActive == true) {
-            AppToast.show(activity, "正在下载更新…")
-            return
-        }
-
-        testUpdateJob =
-            ApkUpdateFlow.startDownloadAndInstall(
-                activity = activity,
-                latestVersionHint = latestVersionHint,
-                apkUrl = latestVersionHint?.let(ApkUpdater::apkUrlFor),
-            ) { latestVersion, isNewer ->
-                if (!isNewer && latestVersionHint == null) state.testUpdateCheckState = TestUpdateCheckState.Latest(latestVersion)
-                state.testUpdateCheckedAtMs = System.currentTimeMillis()
-                renderer.refreshAboutSectionKeepPosition()
-            }
-                ?: return
     }
 
     private fun showProjectDialog() {

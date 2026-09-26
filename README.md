@@ -1,7 +1,39 @@
-# blbl-android
+# blbl-animate
 
 一个第三方哔哩哔哩安卓 App，支持触摸、遥控，以及安卓5，适用于平板、TV、车机等设备。
 
+> 本仓库 fork 自 [cat3399/blbl](https://github.com/cat3399/blbl)。上游项目本身已经很完整，
+> 这个 fork 只围绕「电视上的实际观感」做少量改动，并**移除了所有指向上游作者的网络功能**
+> （日志上传、更新检查、QQ 群入口）。应用内名称仍然是 `Blbl`，包名也未改动。
+
+## 这个 fork 改了什么
+
+### 修复
+
+- **弹幕在部分电视上「前后抖动」**（如 TCL Q10G，官方云视听小电视同样存在）
+  根因不在弹幕算法：SurfaceView 的独立硬件层会让合成器把 UI 层的 vsync 对齐到视频层去「等帧」，
+  实测节拍被拉成 57.7Hz 并出现 33~83ms 的等帧长尾。默认渲染视图改为 TextureView 后，
+  节拍回到 59.96Hz、等帧长尾消失。设置 → 其他设置 → 渲染视图 仍可切回 SurfaceView。
+- **弹幕「时快时慢」**：时间轴改为累加帧回调上报的 vsync 时间戳之差（而不是「回调次数 × 刷新周期」），
+  速率误差被彻底消除，且与视频/直播本身的帧率无关。
+- **评论回复数多算**：主评论的 `count` 包含待审核/折叠等条目，改用 `rcount`
+  （严格等于楼接口返回的 `page.count`）。此前会出现「显示 1 条回复、点开却只有主评论」。
+- **评论区动图不播放 / 完全透明**：CDN 缩略图后缀 `@480w_360h_1c.webp` 会把 GIF 压成静态首帧，
+  现在动图请求原图；播放侧 GIF 改用 `android.graphics.Movie` 自己驱动，不再依赖
+  `AnimatedImageDrawable`（后者必须先挂到 View 上再 `start()`，顺序错了就是「占位但全透明」）。
+
+### 新增
+
+- 评论区图片支持播放动图（GIF / 动画 WebP）
+- 弹幕渲染的诊断日志（3 秒一条 `BLBL/DanmakuPerf`：节拍 `vsP`/`vsQ1`、投递延迟 `late*`、
+  掉拍直方图 `gap`/`step`、绘制耗时 `drawMs`、空闲线程对照探针 `idle*`）
+
+### 移除
+
+- 上传日志到开发者服务器
+- 自动检查更新 / 检查更新
+- QQ 交流群入口
+- 项目地址指向本 fork
 
 ## 界面预览
 
@@ -63,25 +95,19 @@
 可选版本参数（本地或 CI）：
 
 ```
-./gradlew assembleRelease -PversionName=0.1.1 -PversionCode=2
+./gradlew assembleRelease -PversionName=0.1.30 -PversionCode=30
 ```
-
-## 临时更新方案
-**目前在代码中内置了国内环境可直接访问的直链,用于在测试阶段方便的覆盖更新,待后续稳定之后将会移除**,介意者请从release中下载action编译的安装包
 
 ## GitHub Actions
 
-仓库包含两套手动触发的工作流：
+- **Feat Branch Build**：push 到 `feat/**`、`fix/**` 时自动编译 debug 包并上传 artifact。
+- **Android Release**：push tag（`v*`，如 `git push origin v0.1.30`）或手动触发，
+  编译 release 包并发布到 GitHub Releases。
 
-- Android Debug：手动输入 `version_name`
-- Android Release：同上，额外需要签名 Secrets
-
-需要在仓库 Secrets 中配置：
-
-- `RELEASE_KEYSTORE_BASE64`
-- `RELEASE_STORE_PASSWORD`
-- `RELEASE_KEY_ALIAS`
-- `RELEASE_KEY_PASSWORD`
+签名默认使用 CI 临时生成的密钥（每次不同，安装前需先卸载旧包）。想固定签名，
+在仓库 Secrets 里配置 `RELEASE_KEYSTORE_BASE64`（keystore 的 base64）、
+`RELEASE_STORE_PASSWORD`、`RELEASE_KEY_ALIAS`、`RELEASE_KEY_PASSWORD` 即可，
+工作流会自动优先使用它们。
 
 ## 感谢
 
@@ -89,8 +115,8 @@
 - https://github.com/xiaye13579/BBLL 优秀的页面设计和操作逻辑，本项目绝大部分页面和操作逻辑都是抄袭BBLL🥰
 - https://github.com/bggRGjQaUbCoE/PiliPlus 部分关键功能参考了Piliplus的逻辑
 - https://github.com/debugly/ijkplayer 感谢debugly大佬移植的ijkplayer
+- https://github.com/cat3399/blbl 上游项目
 - 开源第三方B站客户端
-- 群友们的详细测试与反馈
 
 ## 免责声明
 

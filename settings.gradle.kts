@@ -14,6 +14,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "blbl-android"
+rootProject.name = "blbl-animate"
 include(":app")
 

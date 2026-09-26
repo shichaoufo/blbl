@@ -257,7 +257,11 @@ internal class VideoCommentsAdapter(
 
             if (v1 != null) {
                 binding.ivPicture1.visibility = View.VISIBLE
-                ImageLoader.loadInto(binding.ivPicture1, ImageUrl.commentThumbnail(v1.url))
+                ImageLoader.loadInto(
+                    binding.ivPicture1,
+                    ImageUrl.commentThumbnail(v1.url),
+                    allowAnimated = true,
+                )
                 binding.ivPicture1.setOnClickListener { onPictureClick(item, 0) }
             } else {
                 binding.ivPicture1.visibility = View.GONE
@@ -267,7 +271,11 @@ internal class VideoCommentsAdapter(
 
             if (v2 != null) {
                 binding.ivPicture2.visibility = View.VISIBLE
-                ImageLoader.loadInto(binding.ivPicture2, ImageUrl.commentThumbnail(v2.url))
+                ImageLoader.loadInto(
+                    binding.ivPicture2,
+                    ImageUrl.commentThumbnail(v2.url),
+                    allowAnimated = true,
+                )
                 binding.ivPicture2.setOnClickListener { onPictureClick(item, 1) }
             } else {
                 binding.ivPicture2.visibility = View.GONE
@@ -277,7 +285,11 @@ internal class VideoCommentsAdapter(
 
             if (v3 != null) {
                 binding.ivPicture3.visibility = View.VISIBLE
-                ImageLoader.loadInto(binding.ivPicture3, ImageUrl.commentThumbnail(v3.url))
+                ImageLoader.loadInto(
+                    binding.ivPicture3,
+                    ImageUrl.commentThumbnail(v3.url),
+                    allowAnimated = true,
+                )
                 binding.ivPicture3.setOnClickListener { onPictureClick(item, 2) }
             } else {
                 binding.ivPicture3.visibility = View.GONE

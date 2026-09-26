@@ -3,6 +3,7 @@ package blbl.cat3399.feature.live
 import blbl.cat3399.core.api.BiliApi
 import blbl.cat3399.core.api.LiveSuperChatJsonParser
 import blbl.cat3399.core.log.AppLog
+import blbl.cat3399.core.model.DanmakuEmote
 import blbl.cat3399.core.model.LiveSuperChat
 import blbl.cat3399.core.net.BiliClient
 import okhttp3.Request
@@ -34,6 +35,8 @@ class LiveMessageClient(
         val eventTimeMs: Long,
         val sendTimeMs: Long?,
         val rndTimeMs: Long?,
+        /** 弹幕自带的表情图（混排或纯表情）。见 [DanmakuEmote]。 */
+        val emotes: List<DanmakuEmote> = emptyList(),
     )
 
     private val scheduler = Executors.newSingleThreadScheduledExecutor { r ->
@@ -283,30 +286,37 @@ class LiveMessageClient(
         val cmd = obj.optString("cmd", "")
         if (cmd.startsWith("DANMU_MSG")) {
             val info = obj.optJSONArray("info") ?: return
-            val msg = info.optString(1, "").takeIf { it.isNotBlank() } ?: return
+            val rawText = info.optString(1, "")
+            val meta = info.optJSONArray(0)
+            val emotes = LiveDanmakuEmoteParser.parse(meta)
+            // 纯表情弹幕的文本可能为空：只要有表情图就照常下发，交给渲染层画图片
+            if (rawText.isBlank() && emotes.isEmpty()) return
             val color =
                 runCatching {
-                    val extra = info.optJSONArray(0) ?: return@runCatching 0xFFFFFF
-                    extra.optInt(3, 0xFFFFFF)
+                    meta ?: return@runCatching 0xFFFFFF
+                    meta.optInt(3, 0xFFFFFF)
                 }.getOrDefault(0xFFFFFF)
             val rndTimeMs =
                 runCatching {
-                    val extra = info.optJSONArray(0) ?: return@runCatching null
-                    extra.optLong(4, 0L).takeIf { it > 0L }
+                    meta ?: return@runCatching null
+                    meta.optLong(4, 0L).takeIf { it > 0L }
                 }.getOrNull()
             val sendTimeMs = obj.optLong("send_time", 0L).takeIf { it > 0L }
             val eventTimeMs = rndTimeMs ?: sendTimeMs ?: System.currentTimeMillis()
             AppLog.i(
                 "LiveDanmaku",
-                "ws room=$roomId event=$eventTimeMs send=$sendTimeMs rnd=$rndTimeMs color=$color textLen=${msg.length}",
+                "ws room=$roomId event=$eventTimeMs send=$sendTimeMs rnd=$rndTimeMs color=$color " +
+                    "textLen=${rawText.length} emotes=${emotes.size} " +
+                    "largeEmotes=${emotes.count { it.large }}",
             )
             onDanmaku(
                 LiveDanmakuEvent(
-                    text = msg,
+                    text = rawText,
                     color = color,
                     eventTimeMs = eventTimeMs,
                     sendTimeMs = sendTimeMs,
                     rndTimeMs = rndTimeMs,
+                    emotes = emotes,
                 ),
             )
             return

@@ -274,6 +274,9 @@ internal class ExoPlayerEngine(
                         "QualitySwitch",
                         "video format changed qn=$qn codecid=$codecid targetQn=${targetQn ?: -1} id=${format.id} " +
                             "size=${format.width}x${format.height} bitrate=${format.bitrate} " +
+                            // 视频自身帧率：电视的「自动帧率匹配」很可能就是按它切显示模式的，
+                            // 所以排查抖动时必须知道内容是多少 fps（弹幕抖和视频抖要分开看）。
+                            "fps=${format.frameRate} " +
                             "reuseResult=${decoderReuseEvaluation?.result ?: -1} discardReasons=${decoderReuseEvaluation?.discardReasons ?: -1} " +
                             "elapsedMs=${if (qualitySwitchStartedAtMs > 0L) SystemClock.elapsedRealtime() - qualitySwitchStartedAtMs else -1L} " +
                             "requestPos=$qualitySwitchStartedPositionMs currentPos=${exoPlayer.currentPosition}",
