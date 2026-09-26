@@ -29,7 +29,7 @@ internal interface DanmakuEngineMainApi {
 
     fun lastDrawFallbackCount(): Int
 
-    fun stepTime(positionMsExact: Double, uiFrameId: Int)
+    fun stepTime(positionMs: Long, uiFrameId: Int)
 
     fun drainReleasedBitmaps(uiFrameId: Int)
 
@@ -43,7 +43,7 @@ internal interface DanmakuEngineActionApi {
 
     fun updateConfig(newConfig: DanmakuConfig)
 
-    fun stepTime(positionMsExact: Double, uiFrameId: Int)
+    fun stepTime(positionMs: Long, uiFrameId: Int)
 
     fun currentPositionMs(): Long
 
@@ -125,10 +125,6 @@ internal class DanmakuEngine(
     override fun lastDrawFallbackCount(): Int = lastDrawFallbackCount
 
     // ---- Time (main writes; action reads) ----
-    // 滚动弹幕的 x 坐标由 elapsed 的逐帧差分决定，必须保留亚毫秒精度：
-    // 量化到整数毫秒会让 120Hz 下 8.333ms 的帧间隔变成 8/8/9 的规律性步长（可见抖动）。
-    // 整数毫秒版本继续用于轨道分配、激活/过期判定等对精度不敏感的场合。
-    @Volatile private var currentPositionExactMs: Double = 0.0
     @Volatile private var currentPositionMs: Long = 0L
     @Volatile private var currentUiFrameId: Int = 0
 
@@ -231,10 +227,8 @@ internal class DanmakuEngine(
     private fun sp(v: Float): Float =
         TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, v, displayMetrics)
 
-    override fun stepTime(positionMsExact: Double, uiFrameId: Int) {
-        val exact = if (positionMsExact.isFinite()) positionMsExact.coerceAtLeast(0.0) else 0.0
-        currentPositionExactMs = exact
-        currentPositionMs = exact.toLong()
+    override fun stepTime(positionMs: Long, uiFrameId: Int) {
+        currentPositionMs = positionMs.coerceAtLeast(0L)
         currentUiFrameId = uiFrameId
     }
 
@@ -395,10 +389,7 @@ internal class DanmakuEngine(
         drawFill.getFontMetrics(drawFontMetrics)
         val styleGen = cacheStyleGeneration
         val width = viewportWidth.coerceAtLeast(0)
-        // 绘制用亚毫秒精度的时间轴。逐帧位移 = elapsed 的差分，量化到整数毫秒
-        // 会把 8.333ms 的帧间隔变成 8/8/9 的规律性步长（比随机抖动更刺眼）。
-        // act 阶段仍走整数毫秒，轨道分配不需要更高精度。
-        val nowMsExact = currentPositionExactMs
+        val nowMs = currentPositionMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
 
         var cachedDrawn = 0
         var fallbackDrawn = 0
@@ -406,13 +397,7 @@ internal class DanmakuEngine(
             val item = snapshot.items[i] ?: continue
             val x =
                 when (item.kind) {
-                    DanmakuKind.SCROLL ->
-                        danmakuScrollX(
-                            width = width,
-                            nowMs = nowMsExact,
-                            startTimeMs = item.startTimeMs,
-                            pxPerMs = item.pxPerMs,
-                        )
+                    DanmakuKind.SCROLL -> scrollX(width = width, nowMs = nowMs, startTimeMs = item.startTimeMs, pxPerMs = item.pxPerMs)
                     DanmakuKind.TOP -> centerX(width = width, contentWidth = item.textWidthPx)
                     DanmakuKind.BOTTOM -> centerX(width = width, contentWidth = item.textWidthPx)
                 }
@@ -866,9 +851,9 @@ internal class DanmakuEngine(
                 }
                 val rear = laneLastScroll[laneIndex] ?: continue
                 val tailPrev =
-                    danmakuScrollX(
+                    scrollX(
                         width = width,
-                        nowMs = nowMs.toDouble(),
+                        nowMs = nowMs,
                         startTimeMs = rear.startTimeMs,
                         pxPerMs = rear.pxPerMs,
                     ) + rear.textWidthPx
@@ -1026,6 +1011,16 @@ internal class DanmakuEngine(
         }
     }
 
+    private fun scrollX(
+        width: Int,
+        nowMs: Int,
+        startTimeMs: Int,
+        pxPerMs: Float,
+    ): Float {
+        val elapsed = (nowMs - startTimeMs).coerceAtLeast(0)
+        return width.toFloat() - elapsed * pxPerMs
+    }
+
     private fun isExpired(
         item: DanmakuItem,
         width: Int,
@@ -1034,9 +1029,9 @@ internal class DanmakuEngine(
         val elapsed = nowMs - item.startTimeMs
         if (elapsed >= item.durationMs) return true
         if (item.kind != DanmakuKind.SCROLL) return false
-        return danmakuScrollX(
+        return scrollX(
             width = width,
-            nowMs = nowMs.toDouble(),
+            nowMs = nowMs,
             startTimeMs = item.startTimeMs,
             pxPerMs = item.pxPerMs,
         ) + item.textWidthPx < 0f
